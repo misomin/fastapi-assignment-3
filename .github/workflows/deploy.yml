@@ -1,0 +1,90 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: misomin06/fastapi:${{ github.sha }}
+
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ec2
+          chmod 600 ~/.ssh/id_ec2
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy image on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          IMAGE: misomin06/fastapi:${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/id_ec2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            "ubuntu@$EC2_HOST" \
+            "sudo -n docker pull '$IMAGE' && (sudo -n docker rm -f fastapi-assignment-3 || true) && sudo -n docker run -d --name fastapi-assignment-3 --restart unless-stopped -p 80:8000 '$IMAGE'"
+
+      - name: Verify deployed source
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import time
+          from urllib.request import urlopen
+
+          src_dir = Path("src")
+          digest = hashlib.sha256()
+          for path in sorted(src_dir.rglob("*.py"), key=lambda item: item.relative_to(src_dir).as_posix()):
+              digest.update(path.read_bytes())
+          expected_hash = digest.hexdigest()
+
+          url = f"http://{os.environ['EC2_HOST']}/health"
+          for attempt in range(30):
+              try:
+                  with urlopen(url, timeout=5) as response:
+                      result = json.load(response)
+                  if result.get("status") == "ok" and result.get("hash") == expected_hash:
+                      print("Deployment verified: /health hash matches this commit")
+                      break
+              except Exception as error:
+                  print(f"Waiting for server: {error}")
+              time.sleep(3)
+          else:
+              raise SystemExit("Deployment verification failed: /health hash did not match")
+          PY
